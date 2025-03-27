@@ -54,7 +54,7 @@ internal sealed partial class NewExtensionForm : NewExtensionFormBase
             "errorMessage": "{{Properties.Resources.builtin_create_extension_name_required}}",
             "id": "ExtensionName",
             "placeholder": "ExtensionName",
-            "regex": "^[^\\s]+$"
+            "regex": "^[A-Za-z_][A-Za-z0-9_]*$"
         },
         {
             "type": "TextBlock",
