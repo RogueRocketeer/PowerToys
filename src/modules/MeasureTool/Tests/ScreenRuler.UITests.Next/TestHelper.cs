@@ -96,45 +96,110 @@ public static class TestHelper
         Assert.AreEqual(enable, toggleSwitch.IsOn, $"Screen Ruler toggle switch should be {(enable ? "ON" : "OFF")} for {testName}");
     }
 
-    /// <summary>Read the activation shortcut from the ShortcutControl's EditButton HelpText.</summary>
+    /// <summary>
+    /// Read the activation shortcut straight from the Settings window's ShortcutControl — the
+    /// EditButton's UIA HelpText, which the control sets to the live shortcut (e.g.
+    /// "Win + Ctrl + Shift + M"). Polls until the window reports a real shortcut (a chord that
+    /// includes a non-modifier key) rather than the "Configure shortcut" placeholder or a transient
+    /// empty value while the page is still binding. Never substitutes a hard-coded default: the test
+    /// must send exactly what the module is bound to, because a wrong/stale default would silently
+    /// fail to activate and mask the real problem.
+    /// </summary>
     public static Key[] ReadActivationShortcut(UITestBase testBase)
     {
         var shortcutCard = testBase.Session.Find<Element>(By.AccessibilityId("Shortcut_ScreenRuler"), 5000);
         var shortcutButton = shortcutCard.Find<Element>(By.AccessibilityId("EditButton"), 5000);
-        return ParseShortcutText(shortcutButton.HelpText);
+
+        string helpText = string.Empty;
+        var deadline = DateTime.UtcNow.AddMilliseconds(5000);
+        do
+        {
+            helpText = shortcutButton.HelpText ?? string.Empty;
+            var keys = ParseShortcutText(helpText);
+            if (HasMainKey(keys))
+            {
+                testBase.TestContext.WriteLine($"Activation shortcut read from Settings: '{helpText}'.");
+                return keys;
+            }
+
+            Thread.Sleep(200);
+        }
+        while (DateTime.UtcNow < deadline);
+
+        Assert.Fail(
+            $"Could not read the Screen Ruler activation shortcut from the Settings window: the " +
+            $"ShortcutControl EditButton HelpText was '{helpText}' (expected a chord such as " +
+            $"'Win + Ctrl + Shift + M'). Refusing to fall back to a hard-coded default.");
+        return Array.Empty<Key>(); // unreachable — Assert.Fail throws.
     }
 
-    /// <summary>Parse "Win + Ctrl + Shift + M" into a Key chord (note: "win" maps to <see cref="Key.LWin"/>).</summary>
+    /// <summary>
+    /// Parse a shortcut string like "Win + Ctrl + Shift + M" into a <see cref="Key"/> chord (note:
+    /// "win" maps to <see cref="Key.LWin"/>). Returns exactly the keys present — NO default
+    /// substitution; the caller decides whether the result is a usable shortcut.
+    /// </summary>
     public static Key[] ParseShortcutText(string shortcutText)
     {
+        var keys = new List<Key>();
         if (string.IsNullOrEmpty(shortcutText))
         {
-            return new[] { Key.LWin, Key.Ctrl, Key.Shift, Key.M };
+            return keys.ToArray();
         }
 
-        var keys = new List<Key>();
         foreach (var part in shortcutText.Split(ShortcutSeparators, StringSplitOptions.RemoveEmptyEntries))
         {
-            var cleanPart = part.Trim().ToLowerInvariant();
-            Key? key = cleanPart switch
-            {
-                "win" or "windows" => Key.LWin,
-                "ctrl" or "control" => Key.Ctrl,
-                "shift" => Key.Shift,
-                "alt" => Key.Alt,
-                _ when cleanPart.Length == 1 && cleanPart[0] >= 'a' && cleanPart[0] <= 'z' =>
-                    (Key)Enum.Parse(typeof(Key), cleanPart.ToUpperInvariant()),
-                _ => null,
-            };
-
+            var key = ParseKeyToken(part);
             if (key.HasValue)
             {
                 keys.Add(key.Value);
             }
         }
 
-        return keys.Count > 0 ? keys.ToArray() : new[] { Key.LWin, Key.Ctrl, Key.Shift, Key.M };
+        return keys.ToArray();
     }
+
+    /// <summary>Map one display token ("Win"/"Ctrl"/"Shift"/"Alt", a letter, a digit, "F5", "Space"…) to a <see cref="Key"/>.</summary>
+    private static Key? ParseKeyToken(string token)
+    {
+        var t = token.Trim();
+        if (t.Length == 0)
+        {
+            return null;
+        }
+
+        switch (t.ToLowerInvariant())
+        {
+            case "win":
+            case "windows":
+                return Key.LWin;
+            case "ctrl":
+            case "control":
+                return Key.Ctrl;
+            case "shift":
+                return Key.Shift;
+            case "alt":
+                return Key.Alt;
+        }
+
+        // Single digit 0-9 → enum names Num0..Num9.
+        if (t.Length == 1 && t[0] >= '0' && t[0] <= '9')
+        {
+            return Enum.TryParse<Key>("Num" + t, out var num) ? num : null;
+        }
+
+        // Letters, function keys ("F5") and named keys ("Space"/"Enter"/"Esc"/"Tab"/"Home"…) match the
+        // Key enum names. Require a leading letter so numeric strings aren't cast straight to enum values.
+        if (char.IsLetter(t[0]) && Enum.TryParse<Key>(t, ignoreCase: true, out var k))
+        {
+            return k;
+        }
+
+        return null;
+    }
+
+    /// <summary>True when the chord includes a non-modifier (main) key — i.e. a real, activatable shortcut.</summary>
+    private static bool HasMainKey(Key[] keys) =>
+        keys.Any(k => k is not (Key.LWin or Key.Ctrl or Key.Shift or Key.Alt));
 
     /// <summary>True when at least one Measure Tool window is open.</summary>
     public static bool IsScreenRulerUIOpen(UITestBase testBase) =>
@@ -261,7 +326,7 @@ public static class TestHelper
 
         var spacingButton = ruler.Find<Element>(By.AccessibilityId(buttonId), 15000);
         Assert.IsNotNull(spacingButton, $"{testName} button should be found");
-        spacingButton.Click(msPostAction: 500);
+        ClickToolButton(spacingButton);
 
         PerformMeasurementAction();
 
@@ -285,7 +350,7 @@ public static class TestHelper
 
         var boundsButton = ruler.Find<Element>(By.AccessibilityId(BoundsButtonId), 15000);
         Assert.IsNotNull(boundsButton, "Bounds button should be found");
-        boundsButton.Click(msPostAction: 500);
+        ClickToolButton(boundsButton);
 
         // Drag a 100x100 box centred on the primary monitor. Move to the start first so the Measure
         // Tool overlay is tracking the cursor before the drag. The 99px delta measures 100x100
@@ -312,6 +377,29 @@ public static class TestHelper
         Assert.IsTrue(
             WaitForScreenRulerUIToDisappear(testBase, 2000),
             "ScreenRulerUI should close after calling CloseScreenRulerUI");
+    }
+
+    /// <summary>
+    /// Click a Measure Tool toolbar button with a REAL mouse press at its centre rather than a UIA
+    /// <c>invoke</c>: it matches a user (and the legacy WinAppDriver click), moves the cursor onto the
+    /// toolbar, and doesn't rely on the Measure Tool honoring a synthetic InvokePattern to switch
+    /// modes. Falls back to the UIA invoke only if <c>search</c> reported no usable bounds. The
+    /// element's X/Y/Width/Height are physical screen pixels (the host is per-monitor DPI aware via
+    /// app.manifest), so they line up with <see cref="MouseHelper"/>'s SetCursorPos coordinates.
+    /// </summary>
+    private static void ClickToolButton(Element button)
+    {
+        if (button.Width > 0 && button.Height > 0)
+        {
+            MouseHelper.MoveTo(button.X + (button.Width / 2), button.Y + (button.Height / 2));
+            Thread.Sleep(150);
+            MouseHelper.LeftClick();
+            Thread.Sleep(500);
+        }
+        else
+        {
+            button.Click(msPostAction: 500);
+        }
     }
 
     /// <summary>Move to the screen centre, left-click to capture, right-click to dismiss.</summary>
