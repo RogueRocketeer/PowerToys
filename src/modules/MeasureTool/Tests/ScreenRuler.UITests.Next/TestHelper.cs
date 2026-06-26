@@ -2,7 +2,6 @@
 // The Microsoft Corporation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
-using System.Diagnostics;
 using System.Text.RegularExpressions;
 using Microsoft.PowerToys.UITest.Next;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -29,10 +28,6 @@ namespace ScreenRuler.UITests.Next;
 public static class TestHelper
 {
     private static readonly string[] ShortcutSeparators = { " + ", "+", " " };
-
-    // After selecting a tool, let the overlay's screen-capture session re-stabilise before the
-    // measurement gesture (winappcli's UIA search for the button briefly disturbs it).
-    private const int CaptureSettleMs = 700;
 
     // Button automation ids from the Measure Tool's Resources.resw.
     public const string BoundsButtonId = "Button_Bounds";
@@ -206,16 +201,9 @@ public static class TestHelper
     private static bool HasMainKey(Key[] keys) =>
         keys.Any(k => k is not (Key.LWin or Key.Ctrl or Key.Shift or Key.Alt));
 
-    /// <summary>
-    /// True when the Measure Tool UI is up. Uses a Win32 PROCESS check, NOT winappcli's
-    /// <c>list-windows</c>: every winappcli call spins up a fresh UIA client that walks the overlay's
-    /// (topmost, layered, per-monitor) tree, and enumerating it repeatedly around a measurement
-    /// disturbs the Measure Tool's own screen capture (it also once hung the CLI for 60s on CI). The
-    /// MeasureToolUI process exists only while the ruler is open, so process-presence is an accurate,
-    /// hang-free, interference-free proxy — exactly the enumeration WinAppDriver never forced.
-    /// </summary>
+    /// <summary>True when at least one Measure Tool window is open.</summary>
     public static bool IsScreenRulerUIOpen(UITestBase testBase) =>
-        Process.GetProcessesByName(ScreenRulerProcess).Length > 0;
+        WindowsFinder.ListByApp(ScreenRulerProcess).Count > 0;
 
     /// <summary>Poll until the Measure Tool UI reaches the requested presence.</summary>
     public static bool WaitForScreenRulerUIState(UITestBase testBase, bool shouldBeOpen, int timeoutMs = 5000, int pollingIntervalMs = 100)
@@ -240,41 +228,29 @@ public static class TestHelper
     public static bool WaitForScreenRulerUIToDisappear(UITestBase testBase, int timeoutMs = 5000) =>
         WaitForScreenRulerUIState(testBase, shouldBeOpen: false, timeoutMs);
 
-    /// <summary>
-    /// Close the Measure Tool UI by force-stopping its transient overlay process(es). See
-    /// <see cref="KillScreenRulerProcesses"/> for why this avoids both winappcli and a synthetic Esc.
-    /// </summary>
-    public static void CloseScreenRulerUI(UITestBase testBase) => KillScreenRulerProcesses();
-
-    /// <summary>
-    /// Force-stop every transient MeasureToolUI overlay process. Used to close after a test AND to
-    /// clear any stale overlay BEFORE activating. Deliberately avoids winappcli (a process-scoped
-    /// <see cref="Session.FromProcess"/> / <see cref="WindowControl.TryCloseByApp"/> run
-    /// <c>list-windows</c> over the overlay — the enumeration this experiment keeps away from the
-    /// Measure Tool) and a synthetic <c>Esc</c> via <c>System.Windows.Forms.SendKeys</c> (it validates
-    /// <c>SendInput</c>'s return count and throws "The operation completed successfully" when the
-    /// Measure Tool's low-level keyboard hook swallows the Esc — and a LEAKED overlay's hook makes the
-    /// very next activation chord throw the same way, which is why we also clear stale ones up front).
-    /// Killing never hangs; the runner re-creates the overlay on the next hotkey.
-    /// </summary>
-    private static void KillScreenRulerProcesses()
+    /// <summary>Close the Measure Tool UI if it's open (best-effort, tolerant).</summary>
+    public static void CloseScreenRulerUI(UITestBase testBase)
     {
-        foreach (var p in Process.GetProcessesByName(ScreenRulerProcess))
+        if (!IsScreenRulerUIOpen(testBase))
         {
-            try
+            return;
+        }
+
+        // Prefer the toolbar's Close button; fall back to WM_CLOSE on every Measure Tool window.
+        try
+        {
+            var ruler = Session.FromProcess(ScreenRulerProcess, PowerToysModule.ScreenRuler, timeoutMS: 2000);
+            if (ruler.Has(By.AccessibilityId(CloseButtonId), 1000))
             {
-                p.Kill();
-                p.WaitForExit(2000);
-            }
-            catch
-            {
-                // Tolerant — a cleanup failure must never mask the real test result.
-            }
-            finally
-            {
-                p.Dispose();
+                ruler.Find<Element>(By.AccessibilityId(CloseButtonId), 2000).Click();
             }
         }
+        catch
+        {
+            // Ignore — fall through to the tolerant WM_CLOSE.
+        }
+
+        WindowControl.TryCloseByApp(ScreenRulerProcess);
     }
 
     /// <summary>Clear the clipboard (STA handled inside the helper).</summary>
@@ -327,16 +303,11 @@ public static class TestHelper
     {
         ClearClipboard();
 
-        // Clear any stale overlay leaked by a previous test BEFORE sending the chord: a leftover
-        // MeasureToolUI keeps a low-level keyboard hook that makes System.Windows.Forms.SendKeys throw
-        // "The operation completed successfully" (PreTestHygiene doesn't cover MeasureToolUI).
-        KillScreenRulerProcesses();
-
         // Park the cursor on the primary-monitor centre so the Measure Tool initialises tracking at a
         // predictable on-screen spot before activation (the cursor can otherwise be anywhere).
         var (cx, cy) = ScreenCenter();
         MouseHelper.MoveTo(cx, cy);
-        Thread.Sleep(150);
+        Thread.Sleep(200);
 
         Assert.IsTrue(
             SendShortcutUntilVisible(testBase, activationKeys),
@@ -353,8 +324,7 @@ public static class TestHelper
         var activationKeys = ReadActivationShortcut(testBase);
         var ruler = ActivateScreenRuler(testBase, activationKeys, testName);
 
-        var spacingButton = FindToolButton(ruler, buttonId);
-        ClickToolButton(spacingButton);
+        SelectToolAndVerify(ruler, buttonId, AcceleratorFor(buttonId), testName);
 
         PerformMeasurementAction();
 
@@ -376,8 +346,7 @@ public static class TestHelper
         var activationKeys = ReadActivationShortcut(testBase);
         var ruler = ActivateScreenRuler(testBase, activationKeys, "bounds test");
 
-        var boundsButton = FindToolButton(ruler, BoundsButtonId);
-        ClickToolButton(boundsButton);
+        SelectToolAndVerify(ruler, BoundsButtonId, Key.Num1, "Bounds");
 
         // Drag a 100x100 box centred on the primary monitor. Move to the start first so the Measure
         // Tool overlay is tracking the cursor before the drag. The 99px delta measures 100x100
@@ -407,51 +376,87 @@ public static class TestHelper
     }
 
     /// <summary>
-    /// Find a toolbar button, then re-search until winappcli's <c>search</c> reports NON-ZERO bounds.
-    /// winappcli can return a 0×0 rectangle for the overlay's buttons while the layered window is still
-    /// painting (seen on Win10), which would push <see cref="ClickToolButton"/> onto its UIA-invoke
-    /// fallback (no real mouse press → the tool may not switch mode). Re-searching gets a real
-    /// rectangle once the overlay has painted, so we can do a true physical click.
+    /// Select a toolbar tool and CONFIRM it engaged by waiting for the full-screen measurement overlay
+    /// window (<c>PowerToys.MeasureToolOverlay</c>) to appear — its presence means the tool is in
+    /// capture state, so a following drag/click will actually measure. Per attempt: a UIA invoke
+    /// (winappcli — needs no focus or on-screen bounds, so it sidesteps the Win10 0×0-bounds problem),
+    /// then, as a backup, the tool's keyboard accelerator (the toolbar labels them "Bounds (Ctrl+1)",
+    /// "Spacing (Ctrl+2)", …). The overlay only shows once the cursor leaves the toolbar onto the
+    /// capture surface, so each check parks the cursor at the measurement spot first. Up to 3 attempts.
     /// </summary>
-    private static Element FindToolButton(Session ruler, string buttonId)
+    private static void SelectToolAndVerify(Session ruler, string buttonId, Key acceleratorDigit, string testName)
     {
-        var button = ruler.Find<Element>(By.AccessibilityId(buttonId), 15000);
+        var (cx, cy) = ScreenCenter();
+        const int attempts = 3;
 
-        var deadline = DateTime.UtcNow.AddMilliseconds(5000);
-        while ((button.Width <= 0 || button.Height <= 0) && DateTime.UtcNow < deadline)
+        for (int attempt = 1; attempt <= attempts; attempt++)
         {
-            Thread.Sleep(250);
-            button = ruler.Find<Element>(By.AccessibilityId(buttonId), 5000);
+            // (a) Accessibility invoke via winappcli — coordinate-free, so a 0×0 button rect is fine.
+            ruler.Find<Element>(By.AccessibilityId(buttonId), 15000).Click(msPostAction: 300);
+            if (MoveOffToolbarAndWaitForOverlay(cx, cy))
+            {
+                return;
+            }
+
+            // (b) Keyboard accelerator backup (Ctrl+<n>) — the toolbar is the foreground window.
+            KeyboardHelper.SendKeys(Key.Ctrl, acceleratorDigit);
+            if (MoveOffToolbarAndWaitForOverlay(cx, cy))
+            {
+                return;
+            }
         }
 
-        return button;
+        Assert.Fail(
+            $"{testName}: the measurement overlay (PowerToys.MeasureToolOverlay) never appeared after " +
+            $"{attempts} accessibility-invoke + keyboard attempts — the Measure Tool never entered " +
+            "capture state, so a measurement can't be taken.");
     }
 
     /// <summary>
-    /// Click a Measure Tool toolbar button with a REAL mouse press at its centre rather than a UIA
-    /// <c>invoke</c>: it matches a user (and the legacy WinAppDriver click), moves the cursor onto the
-    /// toolbar, and doesn't rely on the Measure Tool honoring a synthetic InvokePattern to switch
-    /// modes. Falls back to the UIA invoke only if <c>search</c> reported no usable bounds. The
-    /// element's X/Y/Width/Height are physical screen pixels (the host is per-monitor DPI aware via
-    /// app.manifest), so they line up with <see cref="MouseHelper"/>'s SetCursorPos coordinates.
+    /// Park the cursor at the measurement spot (off the toolbar, two-step so the move is tracked) and
+    /// poll briefly for the measurement overlay window. Returns true once it's present.
     /// </summary>
-    private static void ClickToolButton(Element button)
+    private static bool MoveOffToolbarAndWaitForOverlay(int cx, int cy)
     {
-        if (button.Width > 0 && button.Height > 0)
-        {
-            MouseHelper.MoveTo(button.X + (button.Width / 2), button.Y + (button.Height / 2));
-            Thread.Sleep(150);
-            MouseHelper.LeftClick();
+        MouseHelper.MoveTo(cx - 40, cy - 40);
+        Thread.Sleep(150);
+        MouseHelper.MoveTo(cx, cy);
 
-            // Let the overlay's screen-capture session re-stabilise after the preceding UIA search for
-            // this button (which briefly disturbs it) before the measurement gesture runs.
-            Thread.Sleep(CaptureSettleMs);
-        }
-        else
+        var deadline = DateTime.UtcNow.AddMilliseconds(1500);
+        do
         {
-            button.Click(msPostAction: 500);
+            if (IsMeasureOverlayPresent())
+            {
+                return true;
+            }
+
+            Thread.Sleep(250);
         }
+        while (DateTime.UtcNow < deadline);
+
+        return false;
     }
+
+    /// <summary>
+    /// True when the Measure Tool's full-screen measurement overlay is up — winappcli reports a
+    /// <c>PowerToys.MeasureToolOverlay</c> window (class <c>*OverlayWindow</c>) alongside the toolbar
+    /// once a tool is engaged and the cursor is over the capture surface. This is the reliable
+    /// "we're in capture state" signal that the blind click-then-measure approach was missing.
+    /// </summary>
+    private static bool IsMeasureOverlayPresent() =>
+        WindowsFinder.ListByApp(ScreenRulerProcess).Any(w =>
+            w.Title.Contains("MeasureToolOverlay", StringComparison.OrdinalIgnoreCase) ||
+            w.ClassName.Contains("OverlayWindow", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>The toolbar keyboard accelerator (Ctrl+1..4) that selects each tool.</summary>
+    private static Key AcceleratorFor(string buttonId) => buttonId switch
+    {
+        BoundsButtonId => Key.Num1,
+        SpacingButtonName => Key.Num2,
+        HorizontalSpacingButtonName => Key.Num3,
+        VerticalSpacingButtonName => Key.Num4,
+        _ => Key.Num1,
+    };
 
     /// <summary>Move to the screen centre, left-click to capture, right-click to dismiss.</summary>
     private static void PerformMeasurementAction()
