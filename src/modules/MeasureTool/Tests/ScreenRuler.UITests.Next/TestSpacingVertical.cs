@@ -15,10 +15,6 @@ public class TestSpacingVertical : UITestBase
     {
     }
 
-    // The Measure Tool does its own Windows.Graphics.Capture edge detection; a competing 15 FPS
-    // recorder can starve its frames on CI. Keep the 1s screenshots, drop the recording.
-    protected override bool RecordScreenInPipeline => false;
-
     [TestMethod]
     [TestCategory("Spacing")]
     public void TestScreenRulerVerticalSpacingTool()

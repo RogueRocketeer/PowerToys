@@ -74,14 +74,6 @@ public class UITestBase : IDisposable
     /// </summary>
     protected virtual bool ReuseScopeAcrossTests => false;
 
-    /// <summary>
-    /// When <c>false</c>, the 15 FPS pipeline screen RECORDING is skipped for this test class (the 1s
-    /// diagnostic screenshots still run). Override to <c>false</c> for modules that do their OWN screen
-    /// capture — e.g. the Measure Tool's Windows.Graphics.Capture edge detection — where a second
-    /// continuous capturer can interfere with frame delivery on a busy CI agent. Default <c>true</c>.
-    /// </summary>
-    protected virtual bool RecordScreenInPipeline => true;
-
     /// <param name="scope">Module whose window the test drives.</param>
     /// <param name="size">Optional fixed window size applied once the window appears.</param>
     /// <param name="enableModules">
@@ -395,30 +387,23 @@ public class UITestBase : IDisposable
             screenshotTimer = new System.Threading.Timer(
                 ScreenCapture.TimerCallback, screenshotDirectory, TimeSpan.Zero, TimeSpan.FromMilliseconds(1000));
 
-            // The 15 FPS recording is a SECOND continuous screen capturer. Modules that do their own
-            // screen capture (the Measure Tool's Windows.Graphics.Capture edge detection) opt out via
-            // RecordScreenInPipeline, since a competing capturer can starve WGC frame delivery on a busy
-            // CI agent. The 1s screenshots above stay on for diagnostics.
-            if (RecordScreenInPipeline)
+            recordingDirectory = Path.Combine(baseDirectory, "UITestRecordings_" + Guid.NewGuid());
+            Directory.CreateDirectory(recordingDirectory);
+            try
             {
-                recordingDirectory = Path.Combine(baseDirectory, "UITestRecordings_" + Guid.NewGuid());
-                Directory.CreateDirectory(recordingDirectory);
-                try
+                screenRecording = new ScreenRecording(recordingDirectory);
+                if (screenRecording.IsAvailable)
                 {
-                    screenRecording = new ScreenRecording(recordingDirectory);
-                    if (screenRecording.IsAvailable)
-                    {
-                        _ = screenRecording.StartRecordingAsync();
-                    }
-                    else
-                    {
-                        screenRecording = null;
-                    }
+                    _ = screenRecording.StartRecordingAsync();
                 }
-                catch
+                else
                 {
                     screenRecording = null;
                 }
+            }
+            catch
+            {
+                screenRecording = null;
             }
         }
         catch
